@@ -35,6 +35,17 @@ class PIDState(ctypes.Structure):
         ("integral", ctypes.c_double)
     ]
 
+class KalmanState(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_double),
+        ("y", ctypes.c_double),
+        ("vx", ctypes.c_double),
+        ("vy", ctypes.c_double),
+        ("P", ctypes.c_double * 4 * 4),
+        ("Q", ctypes.c_double * 4 * 4),
+        ("R", ctypes.c_double * 2 * 2)
+    ]
+
 # --- Load C Library ---
 def load_c_lib():
     if not os.path.exists(LIB_PATH):
@@ -67,6 +78,12 @@ def load_c_lib():
     lib.pid_init.argtypes = [ctypes.POINTER(PIDState), ctypes.c_double, ctypes.c_double, ctypes.c_double]
     lib.pid_compute.argtypes = [ctypes.POINTER(PIDState), ctypes.c_double, ctypes.c_double, ctypes.c_double]
     lib.pid_compute.restype = ctypes.c_double
+
+    # Define arguments for Kalman Filter functions
+    lib.kalman_init.argtypes = [ctypes.POINTER(KalmanState), ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double]
+    lib.kalman_predict.argtypes = [ctypes.POINTER(KalmanState), ctypes.c_double]
+    lib.kalman_update.argtypes = [ctypes.POINTER(KalmanState), ctypes.c_double, ctypes.c_double]
+    lib.kalman_get_prediction.argtypes = [ctypes.POINTER(KalmanState), ctypes.c_double, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
 
     return lib
 
@@ -127,30 +144,43 @@ class LaserController:
         self.lib.pid_init(ctypes.byref(self.pid_yaw), 2.0, 0.5, 0.1)
         self.lib.pid_init(ctypes.byref(self.pid_pitch), 2.0, 0.5, 0.1)
         
+        # Initialize Kalman Filter for aiming (Center X, Center Y)
+        self.kf = KalmanState()
+        # Init with center of screen, Q=10 (process noise), R=5 (measurement noise)
+        self.lib.kalman_init(ctypes.byref(self.kf), width/2.0, height/2.0, 10.0, 5.0)
+        
         self.last_time = time.time()
 
-    def update(self, left_x, left_y, right_x, right_y):
+    def update(self, target_x, target_y, found=True):
         current_time = time.time()
         dt = current_time - self.last_time
         if dt <= 0: dt = 0.001 # Avoid div by zero
         self.last_time = current_time
 
-        # Calculate the center of the object in the "virtual center camera"
-        # We approximate this as the midpoint between left and right detections
-        center_x = (left_x + right_x) / 2.0
-        center_y = (left_y + right_y) / 2.0
+        # 1. Kalman Predict
+        self.lib.kalman_predict(ctypes.byref(self.kf), dt)
+
+        # 2. Kalman Update (only if object found)
+        if found:
+            self.lib.kalman_update(ctypes.byref(self.kf), target_x, target_y)
+        
+        # 3. Get Prediction (Lookahead)
+        # Predict where object will be in 0.1s (e.g. to account for lag)
+        pred_x = ctypes.c_double()
+        pred_y = ctypes.c_double()
+        lookahead = 0.1 
+        self.lib.kalman_get_prediction(ctypes.byref(self.kf), lookahead, ctypes.byref(pred_x), ctypes.byref(pred_y))
+        
+        # Use predicted coordinates for aiming
+        aim_x = pred_x.value
+        aim_y = pred_y.value
 
         # Calculate deviation from the image center (optical axis)
-        dx = center_x - (self.width / 2.0)
-        dy = center_y - (self.height / 2.0)
+        dx = aim_x - (self.width / 2.0)
+        dy = aim_y - (self.height / 2.0)
 
         # Calculate angles using trigonometry
         # tan(theta) = opposite / adjacent = dx / focal_length
-        # Note: In computer vision, Y increases downwards. 
-        # For a laser pointer, usually "up" means positive pitch.
-        # So we might need to invert dy depending on the servo setup.
-        # Here we assume positive dy (down in image) -> negative pitch (downwards)
-        
         yaw_rad = math.atan(dx / self.focal_length)
         pitch_rad = math.atan(dy / self.focal_length)
 
@@ -166,7 +196,7 @@ class LaserController:
         self.yaw += yaw_velocity * dt
         self.pitch += pitch_velocity * dt
 
-        return self.yaw, self.pitch
+        return self.yaw, self.pitch, aim_x, aim_y
 
 # --- Simulation Generator (Mock) ---
 # Creates two images with a black dot moving to simulate approach
@@ -258,7 +288,12 @@ def main():
                 prev_rx, prev_ry = c_res.right_x, c_res.right_y
 
                 tracker.update(c_res.distance)
-                yaw, pitch = laser.update(c_res.left_x, c_res.left_y, c_res.right_x, c_res.right_y)
+                
+                # Calculate center for Kalman Filter
+                center_x = (c_res.left_x + c_res.right_x) / 2.0
+                center_y = (c_res.left_y + c_res.right_y) / 2.0
+                
+                yaw, pitch, aim_x, aim_y = laser.update(center_x, center_y, found=True)
                 
                 # Call C function to control hardware
                 lib.set_laser_angles(yaw, pitch)
@@ -266,14 +301,16 @@ def main():
                 # Console Output
                 print(f"Dist: {c_res.distance:.2f}m | "
                       f"Vel: {tracker.velocity:.2f}m/s | "
-                      f"Acc: {tracker.acceleration:.2f}m/s^2 | "
-                      f"Laser -> Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}°")
+                      f"Laser -> Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}° | "
+                      f"Aim: ({aim_x:.0f}, {aim_y:.0f})")
                 
                 # Visualization (Draw info on left frame)
                 display_img = cv2.cvtColor(frame_l, cv2.COLOR_GRAY2BGR)
                 cv2.putText(display_img, f"Dist: {c_res.distance:.2f}m", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.circle(display_img, (c_res.left_x, c_res.left_y), 5, (0, 255, 0), 2)
+                # Draw predicted aim point
+                cv2.circle(display_img, (int(aim_x), int(aim_y)), 5, (255, 0, 0), 2)
                 
                 # Note: In a headless environment (no monitor), cv2.imshow might fail.
                 # Comment out lines below if running on remote server.
@@ -281,10 +318,15 @@ def main():
                 # if cv2.waitKey(1) & 0xFF == ord('q'):
                 #    break
             else:
-                print("Object not found.")
+                print("Object not found. Predicting...")
                 # Reset tracking if object is lost
                 prev_lx, prev_ly = -1, -1
                 prev_rx, prev_ry = -1, -1
+                
+                # Update Laser with prediction only (found=False)
+                yaw, pitch, aim_x, aim_y = laser.update(0, 0, found=False)
+                lib.set_laser_angles(yaw, pitch)
+                print(f"Laser -> Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}° (Predicted)")
 
     except KeyboardInterrupt:
         print("\nStopping...")
