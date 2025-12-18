@@ -213,17 +213,45 @@ class LaserController:
 
         return self.yaw, self.pitch, aim_x, aim_y
 
-# --- Simulation Generator (Mock) ---
+# --- Telemetry Logger (Black Box) ---
+class TelemetryLogger:
+    def __init__(self, filename="flight_data.csv"):
+        self.filename = filename
+        self.start_time = time.time()
+        # Write Header
+        with open(self.filename, "w") as f:
+            f.write("Time,Dist,Vel,RawX,RawY,PredX,PredY,Yaw,Pitch,Found\n")
+            
+    def log(self, dist, vel, raw_x, raw_y, pred_x, pred_y, yaw, pitch, found):
+        t = time.time() - self.start_time
+        with open(self.filename, "a") as f:
+            f.write(f"{t:.3f},{dist:.2f},{vel:.2f},{raw_x},{raw_y},{pred_x:.1f},{pred_y:.1f},{yaw:.2f},{pitch:.2f},{int(found)}\n")
+
+# --- Simulation Generator (Mock) with Fault Injection ---
 # Creates two images with a black dot moving to simulate approach
 class MockCamera:
     def __init__(self):
         self.frame_count = 0
+        self.fault_noise = False
+        self.fault_occlusion = False
+        
+    def inject_fault(self, fault_type):
+        if fault_type == 'noise': self.fault_noise = True
+        elif fault_type == 'occlusion': self.fault_occlusion = True
+        elif fault_type == 'clear': 
+            self.fault_noise = False
+            self.fault_occlusion = False
         
     def get_frames(self):
         # Create white background (sky)
         img_l = np.ones((HEIGHT, WIDTH), dtype=np.uint8) * 255
         img_r = np.ones((HEIGHT, WIDTH), dtype=np.uint8) * 255
         
+        # FAULT: Occlusion (Return blank frames)
+        if self.fault_occlusion:
+            self.frame_count += 1
+            return img_l, img_r
+
         # Simulate approaching object (disparity increases)
         # Frame 0: Disparity 10px -> Far
         # Frame 100: Disparity 100px -> Near
@@ -247,6 +275,12 @@ class MockCamera:
         # Draw object (dark circle)
         cv2.circle(img_l, (lx, y), 20, (50), -1) # Dark gray
         cv2.circle(img_r, (rx, y), 20, (50), -1)
+        
+        # FAULT: Noise Burst (Add random noise)
+        if self.fault_noise:
+            noise = np.random.randint(0, 100, (HEIGHT, WIDTH), dtype=np.uint8)
+            img_l = cv2.add(img_l, noise)
+            img_r = cv2.add(img_r, noise)
         
         self.frame_count += 1
         time.sleep(0.05) # Simulate 20fps
@@ -272,6 +306,17 @@ def main():
 
     # Initialize Watchdog (100ms timeout)
     wd = Watchdog(0.1)
+    
+    # Initialize Telemetry Logger
+    logger = TelemetryLogger()
+    
+    # Fault Injection Instructions
+    print("\n--- CONTROLS ---")
+    print("Press 'n' to inject NOISE")
+    print("Press 'o' to inject OCCLUSION")
+    print("Press 'c' to CLEAR faults")
+    print("Press 'q' to QUIT")
+    print("----------------\n")
 
     try:
         while True:
@@ -319,6 +364,9 @@ def main():
                 # Call C function to control hardware
                 lib.set_laser_angles(yaw, pitch)
                 
+                # Log Data
+                logger.log(c_res.distance, tracker.velocity, center_x, center_y, aim_x, aim_y, yaw, pitch, True)
+                
                 # Console Output
                 print(f"Dist: {c_res.distance:.2f}m | "
                       f"Vel: {tracker.velocity:.2f}m/s | "
@@ -336,8 +384,12 @@ def main():
                 # Note: In a headless environment (no monitor), cv2.imshow might fail.
                 # Comment out lines below if running on remote server.
                 # cv2.imshow("Stereo Tracker (Left)", display_img)
-                # if cv2.waitKey(1) & 0xFF == ord('q'):
-                #    break
+                # key = cv2.waitKey(1) & 0xFF
+                # if key == ord('q'): break
+                # elif key == ord('n'): camera.inject_fault('noise')
+                # elif key == ord('o'): camera.inject_fault('occlusion')
+                # elif key == ord('c'): camera.inject_fault('clear')
+
             else:
                 print("Object not found. Predicting...")
                 # Reset tracking if object is lost
@@ -346,6 +398,9 @@ def main():
                 # Still update laser with prediction
                 yaw, pitch, aim_x, aim_y = laser.update(0, 0, found=False)
                 lib.set_laser_angles(yaw, pitch)
+                
+                # Log Data (with 0 for raw values)
+                logger.log(0, 0, 0, 0, aim_x, aim_y, yaw, pitch, False)
 
             # Check Watchdog
             if not wd.check():
