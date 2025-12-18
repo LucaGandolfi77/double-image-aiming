@@ -2,19 +2,19 @@
 #include <stdlib.h>
 #include <math.h>
 
-// Struttura per restituire i risultati al wrapper
+// Structure to return results to the wrapper
 typedef struct {
-    double distance;      // Distanza in metri
-    double disparity;     // Disparità in pixel
-    int object_found;     // 1 se l'oggetto è stato trovato in entrambi i frame, 0 altrimenti
-    int left_x;           // Coordinata X centroide sinistra
-    int left_y;           // Coordinata Y centroide sinistra
-    int right_x;          // Coordinata X centroide destra
-    int right_y;          // Coordinata Y centroide destra
+    double distance;      // Distance in meters
+    double disparity;     // Disparity in pixels
+    int object_found;     // 1 if object found in both frames, 0 otherwise
+    int left_x;           // Left centroid X coordinate
+    int left_y;           // Left centroid Y coordinate
+    int right_x;          // Right centroid X coordinate
+    int right_y;          // Right centroid Y coordinate
 } StereoResult;
 
-// Funzione helper per trovare il centroide di un oggetto scuro su sfondo chiaro
-// Assumiamo input in scala di grigi (1 byte per pixel) per semplicità e velocità
+// Helper function to find the centroid of a dark object on a light background
+// Assumes grayscale input (1 byte per pixel) for simplicity and speed
 int find_centroid(const unsigned char* img, int width, int height, int threshold, int* out_x, int* out_y) {
     long sum_x = 0;
     long sum_y = 0;
@@ -22,11 +22,11 @@ int find_centroid(const unsigned char* img, int width, int height, int threshold
 
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            // L'immagine è un array 1D. Indice = y * width + x
+            // Image is a 1D array. Index = y * width + x
             unsigned char pixel_val = img[y * width + x];
 
-            // Logica di soglia:
-            // Se il pixel è PIÙ SCURO della soglia, è parte dell'oggetto (cielo è chiaro)
+            // Threshold logic:
+            // If pixel is DARKER than threshold, it is part of the object (sky is light)
             if (pixel_val < threshold) {
                 sum_x += x;
                 sum_y += y;
@@ -38,18 +38,27 @@ int find_centroid(const unsigned char* img, int width, int height, int threshold
     if (count > 0) {
         *out_x = (int)(sum_x / count);
         *out_y = (int)(sum_y / count);
-        return 1; // Trovato
+        return 1; // Found
     }
 
-    return 0; // Non trovato
+    return 0; // Not found
 }
 
-// Funzione principale esportata
-// img_left, img_right: puntatori ai buffer raw delle immagini (grayscale)
-// width, height: dimensioni immagini
-// baseline: distanza tra le camere in metri (es. 2.0)
-// focal_length: lunghezza focale in pixel (dipende dalla camera e risoluzione)
-// threshold: valore 0-255 per distinguere oggetto da cielo
+// Function to control the laser pointer hardware
+// In a real scenario, this would write to a serial port or GPIO
+void set_laser_angles(double yaw, double pitch) {
+    // Simulate hardware control
+    // For example, mapping degrees to servo PWM values (0-255) or similar
+    // Here we just print to stdout to verify the C function is called
+    printf("[C-CORE] HARDWARE CONTROL: Setting Laser -> Yaw: %.2f, Pitch: %.2f\n", yaw, pitch);
+}
+
+// Main exported function
+// img_left, img_right: pointers to raw image buffers (grayscale)
+// width, height: image dimensions
+// baseline: distance between cameras in meters (e.g., 2.0)
+// focal_length: focal length in pixels (depends on camera and resolution)
+// threshold: value 0-255 to distinguish object from sky
 void process_stereo_frame(
     const unsigned char* img_left, 
     const unsigned char* img_right, 
@@ -62,10 +71,10 @@ void process_stereo_frame(
 ) {
     int lx, ly, rx, ry;
     
-    // 1. Trova l'oggetto nell'immagine sinistra
+    // 1. Find object in left image
     int found_l = find_centroid(img_left, width, height, threshold, &lx, &ly);
     
-    // 2. Trova l'oggetto nell'immagine destra
+    // 2. Find object in right image
     int found_r = find_centroid(img_right, width, height, threshold, &rx, &ry);
 
     if (found_l && found_r) {
@@ -75,20 +84,20 @@ void process_stereo_frame(
         result->right_x = rx;
         result->right_y = ry;
 
-        // 3. Calcola Disparità
-        // Disparità = (X_sinistra - X_destra)
-        // Nota: Assumiamo che le camere siano rettificate. 
-        // Se l'oggetto è all'infinito, disparità è 0. Più è vicino, più è alta.
+        // 3. Calculate Disparity
+        // Disparity = (X_left - X_right)
+        // Note: We assume cameras are rectified.
+        // If object is at infinity, disparity is 0. The closer it is, the higher the disparity.
         double disparity = (double)(lx - rx);
 
-        // Gestione casi limite (disparità negativa o zero)
+        // Handle edge cases (negative or zero disparity)
         if (disparity <= 0.1) {
-            disparity = 0.1; // Evita divisione per zero, oggetto molto lontano
+            disparity = 0.1; // Avoid division by zero, object very far away
         }
         
         result->disparity = disparity;
 
-        // 4. Calcola Distanza (Triangolazione)
+        // 4. Calculate Distance (Triangulation)
         // Z = (f * b) / d
         result->distance = (focal_length * baseline) / disparity;
 

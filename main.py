@@ -3,16 +3,17 @@ import cv2
 import numpy as np
 import time
 import os
+import math
 
-# --- Configurazione ---
+# --- Configuration ---
 LIB_PATH = "./libstereo.so"
 WIDTH = 640
 HEIGHT = 480
-BASELINE = 2.0  # Metri
-FOCAL_LENGTH = 800.0 # Pixel (valore ipotetico, va calibrato nella realtà)
-THRESHOLD = 100 # Soglia luminosità (0-255). Sotto = oggetto, Sopra = cielo
+BASELINE = 2.0  # Meters
+FOCAL_LENGTH = 800.0 # Pixels (hypothetical value, needs calibration in reality)
+THRESHOLD = 100 # Brightness threshold (0-255). Below = object, Above = sky
 
-# --- Definizione Struttura C ---
+# --- C Structure Definition ---
 class StereoResult(ctypes.Structure):
     _fields_ = [
         ("distance", ctypes.c_double),
@@ -24,15 +25,15 @@ class StereoResult(ctypes.Structure):
         ("right_y", ctypes.c_int)
     ]
 
-# --- Caricamento Libreria C ---
+# --- Load C Library ---
 def load_c_lib():
     if not os.path.exists(LIB_PATH):
-        print(f"Errore: {LIB_PATH} non trovato. Esegui 'make' prima.")
+        print(f"Error: {LIB_PATH} not found. Run 'make' first.")
         exit(1)
     
     lib = ctypes.CDLL(LIB_PATH)
     
-    # Definizione argomenti funzione
+    # Define function arguments
     lib.process_stereo_frame.argtypes = [
         ctypes.POINTER(ctypes.c_ubyte), # img_left
         ctypes.POINTER(ctypes.c_ubyte), # img_right
@@ -43,9 +44,13 @@ def load_c_lib():
         ctypes.c_int,                   # threshold
         ctypes.POINTER(StereoResult)    # result struct
     ]
+    
+    # Define arguments for laser control function
+    lib.set_laser_angles.argtypes = [ctypes.c_double, ctypes.c_double]
+    
     return lib
 
-# --- Classe Fisica ---
+# --- Physics Class ---
 class PhysicsTracker:
     def __init__(self):
         self.prev_distance = None
@@ -66,51 +71,91 @@ class PhysicsTracker:
         dt = current_time - self.prev_time
         if dt <= 0: return
 
-        # Calcolo Velocità: v = (d2 - d1) / t
-        # Nota: Se l'oggetto si avvicina, la distanza diminuisce, velocità negativa.
-        # Qui calcoliamo la velocità scalare di avvicinamento/allontanamento
+        # Calculate Velocity: v = (d2 - d1) / t
+        # Note: If object approaches, distance decreases, negative velocity.
+        # Here we calculate the scalar velocity of approach/recession
         new_velocity = (current_distance - self.prev_distance) / dt
         
-        # Calcolo Accelerazione: a = (v2 - v1) / t
+        # Calculate Acceleration: a = (v2 - v1) / t
         self.acceleration = (new_velocity - self.prev_velocity) / dt
         self.velocity = new_velocity
 
-        # Aggiorna stato precedente
+        # Update previous state
         self.prev_distance = current_distance
         self.prev_velocity = new_velocity
         self.prev_time = current_time
 
-# --- Generatore Simulazione (Mock) ---
-# Crea due immagini con un pallino nero che si sposta per simulare avvicinamento
+# --- Laser Pointer Controller ---
+class LaserController:
+    def __init__(self, width, height, focal_length):
+        self.width = width
+        self.height = height
+        self.focal_length = focal_length
+        self.yaw = 0.0   # Left/Right angle in degrees
+        self.pitch = 0.0 # Up/Down angle in degrees
+
+    def update(self, left_x, left_y, right_x, right_y):
+        # Calculate the center of the object in the "virtual center camera"
+        # We approximate this as the midpoint between left and right detections
+        center_x = (left_x + right_x) / 2.0
+        center_y = (left_y + right_y) / 2.0
+
+        # Calculate deviation from the image center (optical axis)
+        dx = center_x - (self.width / 2.0)
+        dy = center_y - (self.height / 2.0)
+
+        # Calculate angles using trigonometry
+        # tan(theta) = opposite / adjacent = dx / focal_length
+        # Note: In computer vision, Y increases downwards. 
+        # For a laser pointer, usually "up" means positive pitch.
+        # So we might need to invert dy depending on the servo setup.
+        # Here we assume positive dy (down in image) -> negative pitch (downwards)
+        
+        yaw_rad = math.atan(dx / self.focal_length)
+        pitch_rad = math.atan(dy / self.focal_length)
+
+        self.yaw = math.degrees(yaw_rad)
+        self.pitch = -math.degrees(pitch_rad) # Invert Y for standard pitch
+
+        return self.yaw, self.pitch
+
+# --- Simulation Generator (Mock) ---
+# Creates two images with a black dot moving to simulate approach
 class MockCamera:
     def __init__(self):
         self.frame_count = 0
         
     def get_frames(self):
-        # Crea sfondo bianco (cielo)
+        # Create white background (sky)
         img_l = np.ones((HEIGHT, WIDTH), dtype=np.uint8) * 255
         img_r = np.ones((HEIGHT, WIDTH), dtype=np.uint8) * 255
         
-        # Simula oggetto che si avvicina (disparità aumenta)
-        # Frame 0: Disparità 10px -> Lontano
-        # Frame 100: Disparità 100px -> Vicino
+        # Simulate approaching object (disparity increases)
+        # Frame 0: Disparity 10px -> Far
+        # Frame 100: Disparity 100px -> Near
         
-        base_x = WIDTH // 2
-        y = HEIGHT // 2
-        
-        # Simuliamo un movimento sinusoidale
+        # Simulate sinusoidal movement for distance (disparity)
         shift = abs(np.sin(self.frame_count * 0.05)) * 50 + 10 
         
-        # Disparità = shift * 2 (un po' a sx, un po' a dx)
+        # Simulate movement in X and Y (aiming)
+        # Move center X back and forth
+        offset_x = np.sin(self.frame_count * 0.1) * 100 
+        # Move Y up and down
+        offset_y = np.cos(self.frame_count * 0.1) * 50
+        
+        base_x = (WIDTH // 2) + offset_x
+        y = int((HEIGHT // 2) + offset_y)
+        
+        # Disparity = shift * 2 (a bit left, a bit right)
         lx = int(base_x + shift)
         rx = int(base_x - shift)
         
-        # Disegna oggetto (cerchio nero)
-        cv2.circle(img_l, (lx, y), 20, (50), -1) # Grigio scuro
+        # Draw object (dark circle)
+        cv2.circle(img_l, (lx, y), 20, (50), -1) # Dark gray
         cv2.circle(img_r, (rx, y), 20, (50), -1)
         
         self.frame_count += 1
-        time.sleep(0.05) # Simula 20fps
+        time.sleep(0.05) # Simulate 20fps
         
         return img_l, img_r
 
@@ -118,29 +163,30 @@ class MockCamera:
 def main():
     lib = load_c_lib()
     tracker = PhysicsTracker()
+    laser = LaserController(WIDTH, HEIGHT, FOCAL_LENGTH)
     
-    # Usa MockCamera per testare senza hardware. 
-    # Per usare vere webcam: capL = cv2.VideoCapture(0), capR = cv2.VideoCapture(1)
+    # Use MockCamera to test without hardware. 
+    # To use real webcams: capL = cv2.VideoCapture(0), capR = cv2.VideoCapture(1)
     camera = MockCamera() 
     
-    print("Avvio tracciamento stereo...")
+    print("Starting stereo tracking...")
     print(f"Baseline: {BASELINE}m")
     
     try:
         while True:
-            # 1. Acquisizione
+            # 1. Acquisition
             frame_l, frame_r = camera.get_frames()
             
-            # Assicurarsi che i dati siano C-contiguous (importante per ctypes)
+            # Ensure data is C-contiguous (important for ctypes)
             if not frame_l.flags['C_CONTIGUOUS']: frame_l = np.ascontiguousarray(frame_l)
             if not frame_r.flags['C_CONTIGUOUS']: frame_r = np.ascontiguousarray(frame_r)
 
-            # 2. Preparazione dati per C
+            # 2. Prepare data for C
             c_res = StereoResult()
             p_frame_l = frame_l.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
             p_frame_r = frame_r.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
             
-            # 3. Chiamata alla libreria C (Heavy lifting)
+            # 3. Call C library (Heavy lifting)
             lib.process_stereo_frame(
                 p_frame_l, p_frame_r, 
                 WIDTH, HEIGHT, 
@@ -149,34 +195,38 @@ def main():
                 ctypes.byref(c_res)
             )
             
-            # 4. Elaborazione Fisica (Python)
+            # 4. Physics Processing (Python)
             if c_res.object_found:
                 tracker.update(c_res.distance)
+                yaw, pitch = laser.update(c_res.left_x, c_res.left_y, c_res.right_x, c_res.right_y)
                 
-                # Output Console
+                # Call C function to control hardware
+                lib.set_laser_angles(yaw, pitch)
+                
+                # Console Output
                 print(f"Dist: {c_res.distance:.2f}m | "
                       f"Vel: {tracker.velocity:.2f}m/s | "
                       f"Acc: {tracker.acceleration:.2f}m/s^2 | "
-                      f"Disp: {c_res.disparity:.1f}px")
+                      f"Laser -> Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}°")
                 
-                # Visualizzazione (Disegna info sul frame sinistro)
+                # Visualization (Draw info on left frame)
                 display_img = cv2.cvtColor(frame_l, cv2.COLOR_GRAY2BGR)
                 cv2.putText(display_img, f"Dist: {c_res.distance:.2f}m", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.circle(display_img, (c_res.left_x, c_res.left_y), 5, (0, 255, 0), 2)
                 
-                # Nota: In un ambiente headless (senza monitor), cv2.imshow potrebbe fallire.
-                # Commentare le righe sotto se si esegue su server remoto.
+                # Note: In a headless environment (no monitor), cv2.imshow might fail.
+                # Comment out lines below if running on remote server.
                 # cv2.imshow("Stereo Tracker (Left)", display_img)
                 # if cv2.waitKey(1) & 0xFF == ord('q'):
                 #    break
             else:
-                print("Oggetto non trovato.")
+                print("Object not found.")
 
     except KeyboardInterrupt:
-        print("\nArresto...")
+        print("\nStopping...")
     
-    cv2.destroyAllWindows()
+    # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
