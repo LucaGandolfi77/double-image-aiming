@@ -12,6 +12,7 @@ HEIGHT = 480
 BASELINE = 2.0  # Meters
 FOCAL_LENGTH = 800.0 # Pixels (hypothetical value, needs calibration in reality)
 THRESHOLD = 100 # Brightness threshold (0-255). Below = object, Above = sky
+MIN_PIXELS = 10 # Minimum number of pixels to consider an object
 
 # --- C Structure Definition ---
 class StereoResult(ctypes.Structure):
@@ -23,6 +24,15 @@ class StereoResult(ctypes.Structure):
         ("left_y", ctypes.c_int),
         ("right_x", ctypes.c_int),
         ("right_y", ctypes.c_int)
+    ]
+
+class PIDState(ctypes.Structure):
+    _fields_ = [
+        ("Kp", ctypes.c_double),
+        ("Ki", ctypes.c_double),
+        ("Kd", ctypes.c_double),
+        ("prev_error", ctypes.c_double),
+        ("integral", ctypes.c_double)
     ]
 
 # --- Load C Library ---
@@ -42,12 +52,22 @@ def load_c_lib():
         ctypes.c_double,                # baseline
         ctypes.c_double,                # focal_length
         ctypes.c_int,                   # threshold
+        ctypes.c_int,                   # min_pixels
+        ctypes.c_int,                   # prev_lx
+        ctypes.c_int,                   # prev_ly
+        ctypes.c_int,                   # prev_rx
+        ctypes.c_int,                   # prev_ry
         ctypes.POINTER(StereoResult)    # result struct
     ]
     
     # Define arguments for laser control function
     lib.set_laser_angles.argtypes = [ctypes.c_double, ctypes.c_double]
     
+    # Define arguments for PID functions
+    lib.pid_init.argtypes = [ctypes.POINTER(PIDState), ctypes.c_double, ctypes.c_double, ctypes.c_double]
+    lib.pid_compute.argtypes = [ctypes.POINTER(PIDState), ctypes.c_double, ctypes.c_double, ctypes.c_double]
+    lib.pid_compute.restype = ctypes.c_double
+
     return lib
 
 # --- Physics Class ---
@@ -87,14 +107,34 @@ class PhysicsTracker:
 
 # --- Laser Pointer Controller ---
 class LaserController:
-    def __init__(self, width, height, focal_length):
+    def __init__(self, width, height, focal_length, lib):
         self.width = width
         self.height = height
         self.focal_length = focal_length
+        self.lib = lib
         self.yaw = 0.0   # Left/Right angle in degrees
         self.pitch = 0.0 # Up/Down angle in degrees
+        
+        # Initialize PID controllers
+        self.pid_yaw = PIDState()
+        self.pid_pitch = PIDState()
+        
+        # Tune PID values (Kp, Ki, Kd)
+        # Kp: Proportional gain (speed of approach)
+        # Ki: Integral gain (corrects steady-state error)
+        # Kd: Derivative gain (dampens overshoot)
+        # We treat the PID output as angular velocity (deg/s)
+        self.lib.pid_init(ctypes.byref(self.pid_yaw), 2.0, 0.5, 0.1)
+        self.lib.pid_init(ctypes.byref(self.pid_pitch), 2.0, 0.5, 0.1)
+        
+        self.last_time = time.time()
 
     def update(self, left_x, left_y, right_x, right_y):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        if dt <= 0: dt = 0.001 # Avoid div by zero
+        self.last_time = current_time
+
         # Calculate the center of the object in the "virtual center camera"
         # We approximate this as the midpoint between left and right detections
         center_x = (left_x + right_x) / 2.0
@@ -114,8 +154,17 @@ class LaserController:
         yaw_rad = math.atan(dx / self.focal_length)
         pitch_rad = math.atan(dy / self.focal_length)
 
-        self.yaw = math.degrees(yaw_rad)
-        self.pitch = -math.degrees(pitch_rad) # Invert Y for standard pitch
+        target_yaw = math.degrees(yaw_rad)
+        target_pitch = -math.degrees(pitch_rad) # Invert Y for standard pitch
+
+        # Apply PID Control
+        # The PID computes the angular velocity needed to reach the target
+        yaw_velocity = self.lib.pid_compute(ctypes.byref(self.pid_yaw), target_yaw, self.yaw, dt)
+        pitch_velocity = self.lib.pid_compute(ctypes.byref(self.pid_pitch), target_pitch, self.pitch, dt)
+
+        # Update position: pos += vel * dt
+        self.yaw += yaw_velocity * dt
+        self.pitch += pitch_velocity * dt
 
         return self.yaw, self.pitch
 
@@ -163,7 +212,7 @@ class MockCamera:
 def main():
     lib = load_c_lib()
     tracker = PhysicsTracker()
-    laser = LaserController(WIDTH, HEIGHT, FOCAL_LENGTH)
+    laser = LaserController(WIDTH, HEIGHT, FOCAL_LENGTH, lib)
     
     # Use MockCamera to test without hardware. 
     # To use real webcams: capL = cv2.VideoCapture(0), capR = cv2.VideoCapture(1)
@@ -172,6 +221,10 @@ def main():
     print("Starting stereo tracking...")
     print(f"Baseline: {BASELINE}m")
     
+    # Initialize previous coordinates for tracking optimization
+    prev_lx, prev_ly = -1, -1
+    prev_rx, prev_ry = -1, -1
+
     try:
         while True:
             # 1. Acquisition
@@ -192,11 +245,18 @@ def main():
                 WIDTH, HEIGHT, 
                 BASELINE, FOCAL_LENGTH, 
                 THRESHOLD, 
+                MIN_PIXELS,
+                prev_lx, prev_ly,
+                prev_rx, prev_ry,
                 ctypes.byref(c_res)
             )
             
             # 4. Physics Processing (Python)
             if c_res.object_found:
+                # Update previous coordinates for next frame
+                prev_lx, prev_ly = c_res.left_x, c_res.left_y
+                prev_rx, prev_ry = c_res.right_x, c_res.right_y
+
                 tracker.update(c_res.distance)
                 yaw, pitch = laser.update(c_res.left_x, c_res.left_y, c_res.right_x, c_res.right_y)
                 
@@ -222,6 +282,9 @@ def main():
                 #    break
             else:
                 print("Object not found.")
+                # Reset tracking if object is lost
+                prev_lx, prev_ly = -1, -1
+                prev_rx, prev_ry = -1, -1
 
     except KeyboardInterrupt:
         print("\nStopping...")

@@ -13,20 +13,63 @@ typedef struct {
     int right_y;          // Right centroid Y coordinate
 } StereoResult;
 
-// Helper function to find the centroid of a dark object on a light background
-// Assumes grayscale input (1 byte per pixel) for simplicity and speed
-int find_centroid(const unsigned char* img, int width, int height, int threshold, int* out_x, int* out_y) {
+// PID Controller Structure
+typedef struct {
+    double Kp;
+    double Ki;
+    double Kd;
+    double prev_error;
+    double integral;
+} PIDState;
+
+// Initialize PID Controller
+void pid_init(PIDState* pid, double Kp, double Ki, double Kd) {
+    pid->Kp = Kp;
+    pid->Ki = Ki;
+    pid->Kd = Kd;
+    pid->prev_error = 0.0;
+    pid->integral = 0.0;
+}
+
+// Compute PID Output
+double pid_compute(PIDState* pid, double setpoint, double measured, double dt) {
+    if (dt <= 0.0) return 0.0;
+
+    double error = setpoint - measured;
+    
+    // Integral term
+    pid->integral += error * dt;
+    
+    // Derivative term
+    double derivative = (error - pid->prev_error) / dt;
+    
+    // PID Output
+    double output = (pid->Kp * error) + (pid->Ki * pid->integral) + (pid->Kd * derivative);
+    
+    pid->prev_error = error;
+    
+    return output;
+}
+
+// Helper function to find the centroid with ROI and Noise Filtering
+int find_centroid(const unsigned char* img, int width, int height, int threshold, int min_pixels, int start_x, int start_y, int search_w, int search_h, int* out_x, int* out_y) {
     long sum_x = 0;
     long sum_y = 0;
     long count = 0;
 
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
+    // Clamp ROI to image boundaries
+    int end_x = start_x + search_w;
+    int end_y = start_y + search_h;
+    if (start_x < 0) start_x = 0;
+    if (start_y < 0) start_y = 0;
+    if (end_x > width) end_x = width;
+    if (end_y > height) end_y = height;
+
+    for (int y = start_y; y < end_y; y++) {
+        for (int x = start_x; x < end_x; x++) {
             // Image is a 1D array. Index = y * width + x
             unsigned char pixel_val = img[y * width + x];
 
-            // Threshold logic:
-            // If pixel is DARKER than threshold, it is part of the object (sky is light)
             if (pixel_val < threshold) {
                 sum_x += x;
                 sum_y += y;
@@ -35,7 +78,8 @@ int find_centroid(const unsigned char* img, int width, int height, int threshold
         }
     }
 
-    if (count > 0) {
+    // Filter noise: object must be bigger than min_pixels
+    if (count > min_pixels) {
         *out_x = (int)(sum_x / count);
         *out_y = (int)(sum_y / count);
         return 1; // Found
@@ -54,28 +98,47 @@ void set_laser_angles(double yaw, double pitch) {
 }
 
 // Main exported function
-// img_left, img_right: pointers to raw image buffers (grayscale)
-// width, height: image dimensions
-// baseline: distance between cameras in meters (e.g., 2.0)
-// focal_length: focal length in pixels (depends on camera and resolution)
-// threshold: value 0-255 to distinguish object from sky
+// prev_lx, prev_ly, etc: coordinates from previous frame for ROI (-1 if not found previously)
 void process_stereo_frame(
     const unsigned char* img_left, 
     const unsigned char* img_right, 
-    int width, 
-    int height, 
+    int width, int height, 
     double baseline, 
     double focal_length, 
-    int threshold,
+    int threshold, 
+    int min_pixels,
+    int prev_lx, int prev_ly,
+    int prev_rx, int prev_ry,
     StereoResult* result
 ) {
     int lx, ly, rx, ry;
+    int found_l = 0;
+    int found_r = 0;
     
-    // 1. Find object in left image
-    int found_l = find_centroid(img_left, width, height, threshold, &lx, &ly);
+    // ROI Configuration
+    int roi_size = 100; // Search window size (100x100)
     
-    // 2. Find object in right image
-    int found_r = find_centroid(img_right, width, height, threshold, &rx, &ry);
+    // Search Left
+    if (prev_lx != -1 && prev_ly != -1) {
+        // Fast search in ROI
+        found_l = find_centroid(img_left, width, height, threshold, min_pixels, 
+                                prev_lx - roi_size/2, prev_ly - roi_size/2, roi_size, roi_size, &lx, &ly);
+    }
+    // If not found in ROI (or no prev pos), search full image
+    if (!found_l) {
+        found_l = find_centroid(img_left, width, height, threshold, min_pixels, 
+                                0, 0, width, height, &lx, &ly);
+    }
+
+    // Search Right
+    if (prev_rx != -1 && prev_ry != -1) {
+        found_r = find_centroid(img_right, width, height, threshold, min_pixels, 
+                                prev_rx - roi_size/2, prev_ry - roi_size/2, roi_size, roi_size, &rx, &ry);
+    }
+    if (!found_r) {
+        found_r = find_centroid(img_right, width, height, threshold, min_pixels, 
+                                0, 0, width, height, &rx, &ry);
+    }
 
     if (found_l && found_r) {
         result->object_found = 1;
@@ -84,23 +147,17 @@ void process_stereo_frame(
         result->right_x = rx;
         result->right_y = ry;
 
-        // 3. Calculate Disparity
-        // Disparity = (X_left - X_right)
-        // Note: We assume cameras are rectified.
-        // If object is at infinity, disparity is 0. The closer it is, the higher the disparity.
+        // Calculate Disparity: d = x_left - x_right
+        // (Assuming rectified images where y is same, but we use centroids so y might differ slightly)
         double disparity = (double)(lx - rx);
-
-        // Handle edge cases (negative or zero disparity)
-        if (disparity <= 0.1) {
-            disparity = 0.1; // Avoid division by zero, object very far away
-        }
         
+        // Avoid division by zero
+        if (disparity <= 0.1) disparity = 0.1;
+
         result->disparity = disparity;
 
-        // 4. Calculate Distance (Triangulation)
-        // Z = (f * b) / d
+        // Triangulation Formula: Z = (f * b) / d
         result->distance = (focal_length * baseline) / disparity;
-
     } else {
         result->object_found = 0;
         result->distance = -1.0;
