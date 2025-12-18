@@ -15,15 +15,16 @@ THRESHOLD = 100 # Brightness threshold (0-255). Below = object, Above = sky
 MIN_PIXELS = 10 # Minimum number of pixels to consider an object
 
 # --- C Structure Definition ---
+# AERONAUTICAL STANDARD: Rigorous Types (Matching C int32_t and float64_t)
 class StereoResult(ctypes.Structure):
     _fields_ = [
         ("distance", ctypes.c_double),
         ("disparity", ctypes.c_double),
-        ("object_found", ctypes.c_int),
-        ("left_x", ctypes.c_int),
-        ("left_y", ctypes.c_int),
-        ("right_x", ctypes.c_int),
-        ("right_y", ctypes.c_int)
+        ("object_found", ctypes.c_int32),
+        ("left_x", ctypes.c_int32),
+        ("left_y", ctypes.c_int32),
+        ("right_x", ctypes.c_int32),
+        ("right_y", ctypes.c_int32)
     ]
 
 class PIDState(ctypes.Structure):
@@ -46,6 +47,20 @@ class KalmanState(ctypes.Structure):
         ("R", ctypes.c_double * 2 * 2)
     ]
 
+# --- Watchdog Timer ---
+class Watchdog:
+    def __init__(self, timeout_sec):
+        self.timeout = timeout_sec
+        self.last_kick = time.time()
+    
+    def kick(self):
+        self.last_kick = time.time()
+        
+    def check(self):
+        if (time.time() - self.last_kick) > self.timeout:
+            return False # Watchdog expired
+        return True
+
 # --- Load C Library ---
 def load_c_lib():
     if not os.path.exists(LIB_PATH):
@@ -58,16 +73,16 @@ def load_c_lib():
     lib.process_stereo_frame.argtypes = [
         ctypes.POINTER(ctypes.c_ubyte), # img_left
         ctypes.POINTER(ctypes.c_ubyte), # img_right
-        ctypes.c_int,                   # width
-        ctypes.c_int,                   # height
+        ctypes.c_int32,                 # width
+        ctypes.c_int32,                 # height
         ctypes.c_double,                # baseline
         ctypes.c_double,                # focal_length
-        ctypes.c_int,                   # threshold
-        ctypes.c_int,                   # min_pixels
-        ctypes.c_int,                   # prev_lx
-        ctypes.c_int,                   # prev_ly
-        ctypes.c_int,                   # prev_rx
-        ctypes.c_int,                   # prev_ry
+        ctypes.c_int32,                 # threshold
+        ctypes.c_int32,                 # min_pixels
+        ctypes.c_int32,                 # prev_lx
+        ctypes.c_int32,                 # prev_ly
+        ctypes.c_int32,                 # prev_rx
+        ctypes.c_int32,                 # prev_ry
         ctypes.POINTER(StereoResult)    # result struct
     ]
     
@@ -255,8 +270,14 @@ def main():
     prev_lx, prev_ly = -1, -1
     prev_rx, prev_ry = -1, -1
 
+    # Initialize Watchdog (100ms timeout)
+    wd = Watchdog(0.1)
+
     try:
         while True:
+            # Kick the watchdog at start of loop
+            wd.kick()
+
             # 1. Acquisition
             frame_l, frame_r = camera.get_frames()
             
@@ -321,6 +342,18 @@ def main():
                 print("Object not found. Predicting...")
                 # Reset tracking if object is lost
                 prev_lx, prev_ly = -1, -1
+                
+                # Still update laser with prediction
+                yaw, pitch, aim_x, aim_y = laser.update(0, 0, found=False)
+                lib.set_laser_angles(yaw, pitch)
+
+            # Check Watchdog
+            if not wd.check():
+                print("[CRITICAL] WATCHDOG TIMEOUT! Resetting system...")
+                # In a real system, this would reboot hardware.
+                # Here we just reset the loop state.
+                prev_lx, prev_ly = -1, -1
+                wd.kick() # Reset watchdog
                 prev_rx, prev_ry = -1, -1
                 
                 # Update Laser with prediction only (found=False)

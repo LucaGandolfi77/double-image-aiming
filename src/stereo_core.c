@@ -1,29 +1,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdint.h>
+
+// AERONAUTICAL STANDARD: Rigorous Types
+typedef double float64_t;
+typedef int32_t int32_t; // Explicit re-definition for clarity if needed, or just use int32_t
 
 // Structure to return results to the wrapper
 typedef struct {
-    double distance;      // Distance in meters
-    double disparity;     // Disparity in pixels
-    int object_found;     // 1 if object found in both frames, 0 otherwise
-    int left_x;           // Left centroid X coordinate
-    int left_y;           // Left centroid Y coordinate
-    int right_x;          // Right centroid X coordinate
-    int right_y;          // Right centroid Y coordinate
+    float64_t distance;      // Distance in meters
+    float64_t disparity;     // Disparity in pixels
+    int32_t object_found;    // 1 if object found in both frames, 0 otherwise
+    int32_t left_x;          // Left centroid X coordinate
+    int32_t left_y;          // Left centroid Y coordinate
+    int32_t right_x;         // Right centroid X coordinate
+    int32_t right_y;         // Right centroid Y coordinate
 } StereoResult;
 
 // PID Controller Structure
 typedef struct {
-    double Kp;
-    double Ki;
-    double Kd;
-    double prev_error;
-    double integral;
+    float64_t Kp;
+    float64_t Ki;
+    float64_t Kd;
+    float64_t prev_error;
+    float64_t integral;
 } PIDState;
 
 // Initialize PID Controller
-void pid_init(PIDState* pid, double Kp, double Ki, double Kd) {
+void pid_init(PIDState* pid, float64_t Kp, float64_t Ki, float64_t Kd) {
     pid->Kp = Kp;
     pid->Ki = Ki;
     pid->Kd = Kd;
@@ -32,21 +37,32 @@ void pid_init(PIDState* pid, double Kp, double Ki, double Kd) {
 }
 
 // Compute PID Output
-double pid_compute(PIDState* pid, double setpoint, double measured, double dt) {
-    if (dt <= 0.0) return 0.0;
+// AERONAUTICAL STANDARD: Added Input Validation and Output Clamping
+#define MAX_INTEGRAL 50.0
+#define MAX_OUTPUT_VELOCITY 300.0 // deg/s
 
-    double error = setpoint - measured;
+float64_t pid_compute(PIDState* pid, float64_t setpoint, float64_t measured, float64_t dt) {
+    // Safety: Prevent division by zero
+    if (dt <= 0.0001) return 0.0;
+
+    float64_t error = setpoint - measured;
     
-    // Integral term
+    // Integral term with Anti-Windup (Saturation)
     pid->integral += error * dt;
+    if (pid->integral > MAX_INTEGRAL) pid->integral = MAX_INTEGRAL;
+    if (pid->integral < -MAX_INTEGRAL) pid->integral = -MAX_INTEGRAL;
     
     // Derivative term
-    double derivative = (error - pid->prev_error) / dt;
+    float64_t derivative = (error - pid->prev_error) / dt;
     
     // PID Output
-    double output = (pid->Kp * error) + (pid->Ki * pid->integral) + (pid->Kd * derivative);
+    float64_t output = (pid->Kp * error) + (pid->Ki * pid->integral) + (pid->Kd * derivative);
     
     pid->prev_error = error;
+    
+    // Safety: Output Saturation (Clamping)
+    if (output > MAX_OUTPUT_VELOCITY) output = MAX_OUTPUT_VELOCITY;
+    if (output < -MAX_OUTPUT_VELOCITY) output = -MAX_OUTPUT_VELOCITY;
     
     return output;
 }
@@ -54,25 +70,25 @@ double pid_compute(PIDState* pid, double setpoint, double measured, double dt) {
 // Kalman Filter Structure (Constant Velocity Model)
 // State: [x, y, vx, vy]
 typedef struct {
-    double x, y;      // Position
-    double vx, vy;    // Velocity
-    double P[4][4];   // Error Covariance Matrix
-    double Q[4][4];   // Process Noise Covariance
-    double R[2][2];   // Measurement Noise Covariance
+    float64_t x, y;      // Position
+    float64_t vx, vy;    // Velocity
+    float64_t P[4][4];   // Error Covariance Matrix
+    float64_t Q[4][4];   // Process Noise Covariance
+    float64_t R[2][2];   // Measurement Noise Covariance
 } KalmanState;
 
 // Initialize Kalman Filter
-void kalman_init(KalmanState* kf, double init_x, double init_y, double q_noise, double r_noise) {
+void kalman_init(KalmanState* kf, float64_t init_x, float64_t init_y, float64_t q_noise, float64_t r_noise) {
     kf->x = init_x;
     kf->y = init_y;
     kf->vx = 0.0;
     kf->vy = 0.0;
 
     // Initialize P (Identity * large value for high uncertainty initially)
-    for(int i=0; i<4; i++) for(int j=0; j<4; j++) kf->P[i][j] = (i==j) ? 1000.0 : 0.0;
+    for(int32_t i=0; i<4; i++) for(int32_t j=0; j<4; j++) kf->P[i][j] = (i==j) ? 1000.0 : 0.0;
 
     // Initialize Q (Process Noise)
-    for(int i=0; i<4; i++) for(int j=0; j<4; j++) kf->Q[i][j] = 0.0;
+    for(int32_t i=0; i<4; i++) for(int32_t j=0; j<4; j++) kf->Q[i][j] = 0.0;
     kf->Q[0][0] = q_noise * 0.1; kf->Q[1][1] = q_noise * 0.1; // Position noise
     kf->Q[2][2] = q_noise;       kf->Q[3][3] = q_noise;       // Velocity noise
 
@@ -82,14 +98,14 @@ void kalman_init(KalmanState* kf, double init_x, double init_y, double q_noise, 
 }
 
 // Predict Step
-void kalman_predict(KalmanState* kf, double dt) {
+void kalman_predict(KalmanState* kf, float64_t dt) {
     // 1. Predict State: x = F * x
     kf->x += kf->vx * dt;
     kf->y += kf->vy * dt;
 
     // 2. Predict Covariance: P = F * P * F^T + Q
-    double P_new[4][4];
-    double F[4][4] = {
+    float64_t P_new[4][4];
+    float64_t F[4][4] = {
         {1, 0, dt, 0},
         {0, 1, 0, dt},
         {0, 0, 1, 0},
@@ -97,21 +113,21 @@ void kalman_predict(KalmanState* kf, double dt) {
     };
     
     // Temp = P * F^T
-    double Temp[4][4];
-    for(int i=0; i<4; i++) {
-        for(int j=0; j<4; j++) {
+    float64_t Temp[4][4];
+    for(int32_t i=0; i<4; i++) {
+        for(int32_t j=0; j<4; j++) {
             Temp[i][j] = 0;
-            for(int k=0; k<4; k++) {
+            for(int32_t k=0; k<4; k++) {
                 Temp[i][j] += kf->P[i][k] * F[j][k]; 
             }
         }
     }
     
     // P_new = F * Temp + Q
-    for(int i=0; i<4; i++) {
-        for(int j=0; j<4; j++) {
+    for(int32_t i=0; i<4; i++) {
+        for(int32_t j=0; j<4; j++) {
             P_new[i][j] = 0;
-            for(int k=0; k<4; k++) {
+            for(int32_t k=0; k<4; k++) {
                 P_new[i][j] += F[i][k] * Temp[k][j];
             }
             P_new[i][j] += kf->Q[i][j];
@@ -119,35 +135,35 @@ void kalman_predict(KalmanState* kf, double dt) {
     }
     
     // Copy back
-    for(int i=0; i<4; i++) for(int j=0; j<4; j++) kf->P[i][j] = P_new[i][j];
+    for(int32_t i=0; i<4; i++) for(int32_t j=0; j<4; j++) kf->P[i][j] = P_new[i][j];
 }
 
 // Update Step
-void kalman_update(KalmanState* kf, double meas_x, double meas_y) {
+void kalman_update(KalmanState* kf, float64_t meas_x, float64_t meas_y) {
     // y = z - H * x
-    double y_res[2];
+    float64_t y_res[2];
     y_res[0] = meas_x - kf->x;
     y_res[1] = meas_y - kf->y;
 
     // S = H * P * H^T + R
-    double S[2][2];
+    float64_t S[2][2];
     S[0][0] = kf->P[0][0] + kf->R[0][0];
     S[0][1] = kf->P[0][1] + kf->R[0][1];
     S[1][0] = kf->P[1][0] + kf->R[1][0];
     S[1][1] = kf->P[1][1] + kf->R[1][1];
 
     // Inverse of S
-    double det = S[0][0]*S[1][1] - S[0][1]*S[1][0];
+    float64_t det = S[0][0]*S[1][1] - S[0][1]*S[1][0];
     if(fabs(det) < 1e-6) return; 
-    double S_inv[2][2];
+    float64_t S_inv[2][2];
     S_inv[0][0] =  S[1][1] / det;
     S_inv[0][1] = -S[0][1] / det;
     S_inv[1][0] = -S[1][0] / det;
     S_inv[1][1] =  S[0][0] / det;
 
     // K = P * H^T * S_inv
-    double K[4][2];
-    for(int i=0; i<4; i++) {
+    float64_t K[4][2];
+    for(int32_t i=0; i<4; i++) {
         K[i][0] = kf->P[i][0] * S_inv[0][0] + kf->P[i][1] * S_inv[1][0];
         K[i][1] = kf->P[i][0] * S_inv[0][1] + kf->P[i][1] * S_inv[1][1];
     }
@@ -159,29 +175,29 @@ void kalman_update(KalmanState* kf, double meas_x, double meas_y) {
     kf->vy += K[3][0] * y_res[0] + K[3][1] * y_res[1];
 
     // Update Covariance: P = (I - K * H) * P
-    double P_new[4][4];
-    double I_KH[4][4];
-    for(int i=0; i<4; i++) for(int j=0; j<4; j++) I_KH[i][j] = (i==j) ? 1.0 : 0.0;
+    float64_t P_new[4][4];
+    float64_t I_KH[4][4];
+    for(int32_t i=0; i<4; i++) for(int32_t j=0; j<4; j++) I_KH[i][j] = (i==j) ? 1.0 : 0.0;
     
-    for(int i=0; i<4; i++) {
+    for(int32_t i=0; i<4; i++) {
         I_KH[i][0] -= K[i][0];
         I_KH[i][1] -= K[i][1];
     }
 
-    for(int i=0; i<4; i++) {
-        for(int j=0; j<4; j++) {
+    for(int32_t i=0; i<4; i++) {
+        for(int32_t j=0; j<4; j++) {
             P_new[i][j] = 0;
-            for(int k=0; k<4; k++) {
+            for(int32_t k=0; k<4; k++) {
                 P_new[i][j] += I_KH[i][k] * kf->P[k][j];
             }
         }
     }
     
-    for(int i=0; i<4; i++) for(int j=0; j<4; j++) kf->P[i][j] = P_new[i][j];
+    for(int32_t i=0; i<4; i++) for(int32_t j=0; j<4; j++) kf->P[i][j] = P_new[i][j];
 }
 
 // Get predicted position at future time
-void kalman_get_prediction(KalmanState* kf, double dt_ahead, double* out_x, double* out_y) {
+void kalman_get_prediction(KalmanState* kf, float64_t dt_ahead, float64_t* out_x, float64_t* out_y) {
     *out_x = kf->x + kf->vx * dt_ahead;
     *out_y = kf->y + kf->vy * dt_ahead;
 }
