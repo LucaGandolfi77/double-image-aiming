@@ -47,6 +47,58 @@ class KalmanState(ctypes.Structure):
         ("R", ctypes.c_double * 2 * 2)
     ]
 
+# --- AI Supervisor (High-Level Control) ---
+class AISupervisor:
+    def __init__(self, laser_controller):
+        self.laser = laser_controller
+        self.error_history = []
+        self.history_len = 20
+        self.maneuver_threshold = 50.0 # Pixel deviation
+        
+    def analyze(self, aim_x, aim_y, raw_x, raw_y, dt):
+        # 1. Anomaly Detection (Maneuver Detection)
+        # Compare Kalman prediction (aim) with raw measurement
+        # If difference is huge, object is maneuvering faster than model
+        residual = math.sqrt((aim_x - raw_x)**2 + (aim_y - raw_y)**2)
+        
+        if residual > self.maneuver_threshold:
+            print(f"[AI] MANEUVER DETECTED! Residual: {residual:.1f}. Boosting Kalman Q.")
+            # Increase Process Noise (Q) to trust measurement more
+            # Accessing C struct directly
+            self.laser.kf.Q[0][0] = 100.0
+            self.laser.kf.Q[1][1] = 100.0
+            self.laser.kf.Q[2][2] = 100.0
+            self.laser.kf.Q[3][3] = 100.0
+        else:
+            # Decay Q back to normal (10.0)
+            if self.laser.kf.Q[0][0] > 10.0:
+                self.laser.kf.Q[0][0] *= 0.95
+                self.laser.kf.Q[1][1] *= 0.95
+                self.laser.kf.Q[2][2] *= 0.95
+                self.laser.kf.Q[3][3] *= 0.95
+
+        # 2. Adaptive PID Tuning
+        # Monitor tracking error (difference between center and aim)
+        # Ideally, we want aim to be center (WIDTH/2, HEIGHT/2) eventually? 
+        # No, aim is where we point. The error is (Target - Current_Laser_Pos).
+        # But we don't have feedback of actual laser pos here, only the command.
+        # We can monitor the stability of the command.
+        
+        self.error_history.append(residual)
+        if len(self.error_history) > self.history_len:
+            self.error_history.pop(0)
+            
+        avg_error = sum(self.error_history) / len(self.error_history)
+        
+        # Simple Heuristic: If error is consistently low, increase Kp for faster response
+        # If error is high/oscillating, decrease Kp
+        if avg_error < 5.0:
+            self.laser.pid_yaw.Kp = min(self.laser.pid_yaw.Kp * 1.01, 5.0) # Cap at 5.0
+            self.laser.pid_pitch.Kp = min(self.laser.pid_pitch.Kp * 1.01, 5.0)
+        elif avg_error > 20.0:
+            self.laser.pid_yaw.Kp = max(self.laser.pid_yaw.Kp * 0.99, 0.5) # Floor at 0.5
+            self.laser.pid_pitch.Kp = max(self.laser.pid_pitch.Kp * 0.99, 0.5)
+
 # --- Watchdog Timer ---
 class Watchdog:
     def __init__(self, timeout_sec):
@@ -310,6 +362,9 @@ def main():
     # Initialize Telemetry Logger
     logger = TelemetryLogger()
     
+    # Initialize AI Supervisor
+    ai = AISupervisor(laser)
+    
     # Fault Injection Instructions
     print("\n--- CONTROLS ---")
     print("Press 'n' to inject NOISE")
@@ -361,6 +416,10 @@ def main():
                 
                 yaw, pitch, aim_x, aim_y = laser.update(center_x, center_y, found=True)
                 
+                # AI Analysis & Control
+                # Calculate dt (approx 0.05s from sleep)
+                ai.analyze(aim_x, aim_y, center_x, center_y, 0.05)
+                
                 # Call C function to control hardware
                 lib.set_laser_angles(yaw, pitch)
                 
@@ -371,7 +430,8 @@ def main():
                 print(f"Dist: {c_res.distance:.2f}m | "
                       f"Vel: {tracker.velocity:.2f}m/s | "
                       f"Laser -> Yaw: {yaw:.1f}°, Pitch: {pitch:.1f}° | "
-                      f"Aim: ({aim_x:.0f}, {aim_y:.0f})")
+                      f"Aim: ({aim_x:.0f}, {aim_y:.0f}) | "
+                      f"Kp: {laser.pid_yaw.Kp:.2f}")
                 
                 # Visualization (Draw info on left frame)
                 display_img = cv2.cvtColor(frame_l, cv2.COLOR_GRAY2BGR)
