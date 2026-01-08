@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Simulazione Double Image Aiming - Top Down</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <style>
         body {
             background-color: #121212;
@@ -45,6 +46,16 @@
             align-items: center;
             border-right: 1px solid #333;
             overflow: hidden;
+        }
+
+        #canvas-3d-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
+            background-color: #000;
         }
 
         canvas {
@@ -119,6 +130,16 @@
         button:active { background: #555; }
         button.active { background: #4caf50; border-color: #4caf50; color: #000; }
 
+        .camera-info {
+            font-size: 0.75rem;
+            color: #888;
+            margin-left: auto;
+            font-family: 'Courier New', monospace;
+            display: none;
+        }
+
+        .camera-info.show { display: block; }
+
         input[type=range] {
             flex: 1;
             accent-color: #4caf50;
@@ -184,7 +205,9 @@
             font-weight: bold;
             color: #fff;
             font-size: 12px;
+            cursor: grab;
         }
+        #debug-header.grabbing { cursor: grabbing; }
 
         #debug-content {
             flex: 1;
@@ -215,13 +238,31 @@
         #debug-content::-webkit-scrollbar { width: 8px; }
         #debug-content::-webkit-scrollbar-track { background: #111; }
         #debug-content::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
+        /* 3D labels overlay */
+        .label3d {
+            position: absolute;
+            transform: translate(-50%, -120%);
+            background: rgba(0,0,0,0.6);
+            color: #e6f7ff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            pointer-events: none;
+            white-space: nowrap;
+            z-index: 900;
+            border: 1px solid rgba(150,200,255,0.15);
+        }
     </style>
 </head>
 <body>
 
 <header>
     <h1>TOP-DOWN AIMING VISUALIZATION</h1>
-    <div style="font-size: 0.8rem; color: #888;">Simulazione v2.1 (Debug Mode)</div>
+    <div style="display:flex; align-items:center; gap:10px;">
+        <div style="font-size: 0.8rem; color: #888;">Simulazione v2.1 (Debug Mode)</div>
+        <button id="btn-toggle-diagnostics" style="padding:6px 10px; font-size:0.9rem;">Hide Diagnostics</button>
+    </div>
 </header>
 
 <!-- Debug Console Overlay -->
@@ -236,6 +277,10 @@
 <div id="main-container">
     <div id="canvas-container">
         <canvas id="simCanvas" width="640" height="480"></canvas>
+        <div id="canvas-3d-container">
+            <div id="label-camera" class="label3d" style="display:none">CAM: --</div>
+            <div id="label-target" class="label3d" style="display:none">TGT: --</div>
+        </div>
     </div>
 
     <div id="sidebar">
@@ -291,6 +336,14 @@
     <button id="btn-zoom-out">-</button>
     <span id="zoom-level">100%</span>
     <button id="btn-zoom-in">+</button>
+
+    <div style="width: 1px; height: 20px; background: #444; margin: 0 10px;"></div>
+    <button id="btn-toggle-view">🔄 2D Mode</button>
+    
+    <div class="camera-info" id="camera-info">
+        <div>CAM: <span id="cam-pos">0,0,0</span></div>
+        <div>WASD/Arrows: Move | Mouse: Look | Scroll: Zoom</div>
+    </div>
 </div>
 
 <script>
@@ -318,6 +371,107 @@
         debugContent.innerHTML = '';
         log("Console cleared.");
     });
+
+    // Toggle diagnostics visibility
+    const debugConsoleEl = document.getElementById('debug-console');
+    const diagToggleBtn = document.getElementById('btn-toggle-diagnostics');
+    if (diagToggleBtn) {
+        diagToggleBtn.addEventListener('click', () => {
+            if (debugConsoleEl.style.display === 'none') {
+                debugConsoleEl.style.display = 'flex';
+                diagToggleBtn.textContent = 'Hide Diagnostics';
+                log('Diagnostics shown.');
+            } else {
+                debugConsoleEl.style.display = 'none';
+                diagToggleBtn.textContent = 'Show Diagnostics';
+                log('Diagnostics hidden.');
+            }
+        });
+    }
+
+    // Keyboard shortcut: 'P' to toggle diagnostics (ignore when typing in inputs)
+    document.addEventListener('keydown', (e) => {
+        try {
+            if (!diagToggleBtn) return;
+            if (e.ctrlKey || e.altKey || e.metaKey) return; // ignore combos
+            if ((document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.isContentEditable))) return;
+            if (e.key && e.key.toLowerCase() === 'p') {
+                diagToggleBtn.click();
+            }
+        } catch (err) {
+            console.error('Shortcut error', err);
+        }
+    });
+
+    // Make diagnostics console draggable (mouse + touch)
+    (function makeDebugDraggable() {
+        const header = document.getElementById('debug-header');
+        if (!header || !debugConsoleEl) return;
+
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+        let boxW = debugConsoleEl.offsetWidth;
+        let boxH = debugConsoleEl.offsetHeight;
+
+        function startDrag(clientX, clientY) {
+            const rect = debugConsoleEl.getBoundingClientRect();
+            offsetX = clientX - rect.left;
+            offsetY = clientY - rect.top;
+            boxW = rect.width;
+            boxH = rect.height;
+            dragging = true;
+            header.classList.add('grabbing');
+            document.body.style.userSelect = 'none';
+        }
+
+        function doDrag(clientX, clientY) {
+            if (!dragging) return;
+            let left = clientX - offsetX;
+            let top = clientY - offsetY;
+            // keep inside window
+            left = Math.max(0, Math.min(window.innerWidth - boxW, left));
+            top = Math.max(0, Math.min(window.innerHeight - boxH, top));
+            debugConsoleEl.style.left = left + 'px';
+            debugConsoleEl.style.top = top + 'px';
+            debugConsoleEl.style.right = 'auto';
+        }
+
+        function endDrag() {
+            if (!dragging) return;
+            dragging = false;
+            header.classList.remove('grabbing');
+            document.body.style.userSelect = '';
+        }
+
+        header.addEventListener('mousedown', (e) => {
+            startDrag(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            doDrag(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mouseup', () => {
+            endDrag();
+        });
+
+        // touch support
+        header.addEventListener('touchstart', (e) => {
+            const t = e.touches[0];
+            startDrag(t.clientX, t.clientY);
+            e.preventDefault();
+        }, { passive: false });
+
+        document.addEventListener('touchmove', (e) => {
+            if (!dragging) return;
+            const t = e.touches[0];
+            doDrag(t.clientX, t.clientY);
+            e.preventDefault();
+        }, { passive: false });
+
+        document.addEventListener('touchend', () => { endDrag(); });
+    })();
 
     // Capture Global Errors
     window.onerror = function(msg, url, line, col, error) {
@@ -372,6 +526,65 @@
     const pitchDisplay = document.getElementById('val-pitch');
     const zoomDisplay = document.getElementById('zoom-level');
     const horizonLine = document.getElementById('horizon-line');
+    const cameraContainer = document.getElementById('canvas-3d-container');
+    const cameraInfo = document.getElementById('camera-info');
+    const camPosDisplay = document.getElementById('cam-pos');
+
+    // 3D labels elements
+    const labelCamera = document.getElementById('label-camera');
+    const labelTarget = document.getElementById('label-target');
+
+    // Project a THREE.Vector3 to 2D screen coords (relative to renderer DOM)
+    function projectToScreen(vec3, cam) {
+        if (!renderer || !renderer.domElement) return null;
+        const width = renderer.domElement.clientWidth;
+        const height = renderer.domElement.clientHeight;
+        const pos = vec3.clone();
+        pos.project(cam);
+        // pos.x/y in NDC (-1..1)
+        const x = (pos.x * 0.5 + 0.5) * width;
+        const y = (-pos.y * 0.5 + 0.5) * height;
+        // visible if in front of camera and inside clip space
+        const visible = pos.z > -1 && pos.z < 1;
+        return { x, y, visible };
+    }
+
+    function ensure3DLabels() {
+        // already created in DOM statically; ensure style sized to container
+        if (labelCamera) labelCamera.style.display = 'none';
+        if (labelTarget) labelTarget.style.display = 'none';
+    }
+
+    function updateLabels() {
+        if (!renderer || !camera) return;
+        try {
+            if (cameraSphere && labelCamera) {
+                const p = projectToScreen(cameraSphere.position, camera);
+                if (p && p.visible) {
+                    labelCamera.style.display = 'block';
+                    labelCamera.style.left = Math.round(p.x) + 'px';
+                    labelCamera.style.top = Math.round(p.y) + 'px';
+                    labelCamera.textContent = `CAM: ${cameraSphere.position.x.toFixed(1)}, ${cameraSphere.position.y.toFixed(1)}, ${cameraSphere.position.z.toFixed(1)}`;
+                } else if (labelCamera) {
+                    labelCamera.style.display = 'none';
+                }
+            }
+
+            if (targetObject && labelTarget) {
+                const p2 = projectToScreen(targetObject.position, camera);
+                if (p2 && p2.visible) {
+                    labelTarget.style.display = 'block';
+                    labelTarget.style.left = Math.round(p2.x) + 'px';
+                    labelTarget.style.top = Math.round(p2.y) + 'px';
+                    labelTarget.textContent = `TGT: ${targetObject.position.x.toFixed(1)}, ${targetObject.position.y.toFixed(1)}, ${targetObject.position.z.toFixed(1)}`;
+                } else if (labelTarget) {
+                    labelTarget.style.display = 'none';
+                }
+            }
+        } catch (err) {
+            log('updateLabels: WARNING - ' + (err.message || err), 'warn');
+        }
+    }
 
     const btnPlay = document.getElementById('btn-play');
     const btnPause = document.getElementById('btn-pause');
@@ -379,6 +592,7 @@
     const btnNext = document.getElementById('btn-next');
     const btnZoomIn = document.getElementById('btn-zoom-in');
     const btnZoomOut = document.getElementById('btn-zoom-out');
+    const btnToggleView = document.getElementById('btn-toggle-view');
     const filePicker = document.getElementById('file-picker');
     const csvList = document.getElementById('csv-list');
     const btnLoadSelected = document.getElementById('btn-load-selected');
@@ -387,13 +601,417 @@
     let isPlaying = false;
     let playInterval = null;
     let zoom = 1.0;
-    const playbackSpeedMS = 50; 
+    const playbackSpeedMS = 50;
+    // Top-down pan state and 2D input
+    let panX = 0;
+    let panY = 0;
+    const panSpeedBase = 6; // pixels per frame at zoom=1
+    const keys2D = { up: false, down: false, left: false, right: false };
+    
+    // 3D Scene Management
+    let scene, camera, renderer, cameraControls;
+    let is3DMode = false;
+    let targetObject, predictedObject;
+    let trailLineTarget, trailLinePredicted;
+    let cameraSphere;
+    let fovCone;
 
     // CONSTANTS FOR TOP-DOWN VIEW
     const FOCAL_LENGTH = 800;
     const CENTER_X = 320;
     const SCALE = 5.0; // Pixels per meter
-    const OBSERVER_Y_OFFSET = 50; 
+    const OBSERVER_Y_OFFSET = 50;
+
+    // --- INITIALIZE 3D SCENE ---
+    function initialize3DScene() {
+        log('initialize3DScene: starting 3D initialization...');
+        if (typeof THREE === 'undefined') {
+            log('initialize3DScene: ERROR - Three.js not found (THREE is undefined)', 'error');
+            // show console if hidden
+            if (debugConsoleEl && debugConsoleEl.style.display === 'none') { debugConsoleEl.style.display = 'flex'; diagToggleBtn.textContent = 'Hide Diagnostics'; }
+            return;
+        }
+        // Scene
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0d1117);
+        scene.fog = new THREE.Fog(0x0d1117, 500, 1500);
+
+        // Camera
+        camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
+        camera.position.set(0, 30, 60);
+        camera.lookAt(0, 0, 0);
+
+        // Renderer
+        try {
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(cameraContainer.clientWidth, cameraContainer.clientHeight);
+            renderer.shadowMap.enabled = true;
+            cameraContainer.appendChild(renderer.domElement);
+            log('initialize3DScene: WebGLRenderer created and appended to DOM');
+            // Report GL capabilities
+            try {
+                const gl = renderer.getContext();
+                if (gl) {
+                    const glInfo = {
+                        VERSION: gl.getParameter(gl.VERSION),
+                        SHADING_LANGUAGE_VERSION: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
+                        VENDOR: gl.getParameter(gl.VENDOR),
+                        RENDERER: gl.getParameter(gl.RENDERER)
+                    };
+                    log('initialize3DScene: WebGL context info: ' + JSON.stringify(glInfo));
+                } else {
+                    log('initialize3DScene: WARNING - renderer.getContext() returned null', 'warn');
+                }
+            } catch (err) {
+                log('initialize3DScene: WARNING reading GL parameters: ' + (err.message || err), 'warn');
+            }
+            // Context lost handler
+            try {
+                renderer.domElement.addEventListener('webglcontextlost', (ev) => {
+                    log('WebGL context lost on renderer.domElement', 'error');
+                    ev.preventDefault();
+                });
+                renderer.domElement.addEventListener('webglcontextrestored', () => {
+                    log('WebGL context restored', 'info');
+                });
+            } catch (err) { /* ignore */ }
+        } catch (err) {
+            log('initialize3DScene: FAILED to create WebGLRenderer: ' + err.message, 'error');
+            console.error(err);
+            return;
+        }
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(50, 60, 50);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        scene.add(directionalLight);
+
+        // Use a large grid as ground replacement (no solid plane)
+        const gridHelper = new THREE.GridHelper(600, 120, 0x333333, 0x1a1a1a);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+        try { log('initialize3DScene: added GridHelper (size 600, divisions 120) as ground replacement'); } catch(e){}
+
+        // Axes Helper
+        const axesHelper = new THREE.AxesHelper(50);
+        axesHelper.position.y = 0.02;
+        scene.add(axesHelper);
+        try { log('initialize3DScene: added AxesHelper (size 50)'); } catch(e){}
+
+        // Target Object (Green triangle)
+        const targetGeometry = new THREE.ConeGeometry(5, 15, 8);
+        const targetMaterial = new THREE.MeshStandardMaterial({ color: 0x4caf50, emissive: 0x2a7a27 });
+        targetObject = new THREE.Mesh(targetGeometry, targetMaterial);
+        targetObject.castShadow = true;
+        targetObject.receiveShadow = true;
+        scene.add(targetObject);
+        try { log(`initialize3DScene: targetObject created at initial pos ${JSON.stringify(targetObject.position)}`); } catch(e){}
+
+        // Predicted Object (Cyan circle)
+        const predGeometry = new THREE.SphereGeometry(4, 16, 16);
+        const predMaterial = new THREE.MeshStandardMaterial({ color: 0x00bcd4, emissive: 0x007a99 });
+        predictedObject = new THREE.Mesh(predGeometry, predMaterial);
+        predictedObject.castShadow = true;
+        predictedObject.receiveShadow = true;
+        scene.add(predictedObject);
+        try { log('initialize3DScene: predictedObject created'); } catch(e){}
+
+        // Trail for target
+        const trailGeometry = new THREE.BufferGeometry();
+        const trailMaterial = new THREE.LineBasicMaterial({ color: 0x4caf50, linewidth: 2 });
+        trailLineTarget = new THREE.Line(trailGeometry, trailMaterial);
+        scene.add(trailLineTarget);
+        try { log('initialize3DScene: trailLineTarget added (empty)'); } catch(e){}
+
+        // Trail for predicted
+        const trailGeometry2 = new THREE.BufferGeometry();
+        const trailMaterial2 = new THREE.LineBasicMaterial({ color: 0x00bcd4, linewidth: 2 });
+        trailLinePredicted = new THREE.Line(trailGeometry2, trailMaterial2);
+        scene.add(trailLinePredicted);
+        try { log('initialize3DScene: trailLinePredicted added (empty)'); } catch(e){}
+
+        // Observer/Camera position
+        const observerGeometry = new THREE.ConeGeometry(8, 12, 8);
+        const observerMaterial = new THREE.MeshStandardMaterial({ color: 0x888888 });
+        const observer = new THREE.Mesh(observerGeometry, observerMaterial);
+        observer.rotation.x = -Math.PI / 2;
+        observer.position.y = 0;
+        observer.castShadow = true;
+        scene.add(observer);
+
+        // Camera marker: light-blue sphere representing the camera position
+        try {
+            const camSphereGeom = new THREE.SphereGeometry(3, 16, 16);
+            const camSphereMat = new THREE.MeshStandardMaterial({ color: 0xadd8e6, emissive: 0x112233, roughness: 0.6 });
+            cameraSphere = new THREE.Mesh(camSphereGeom, camSphereMat);
+            cameraSphere.position.copy(camera.position);
+            scene.add(cameraSphere);
+            log(`initialize3DScene: cameraSphere added at ${JSON.stringify(cameraSphere.position)}`);
+        } catch (err) {
+            log('initialize3DScene: WARNING - failed to create cameraSphere: ' + (err.message || err), 'warn');
+        }
+
+        // Camera Controls
+        try {
+            cameraControls = new CameraControl3D(camera, renderer.domElement);
+            log('initialize3DScene: Camera controls initialized');
+        } catch (err) {
+            log('initialize3DScene: WARNING - CameraControl3D initialization failed: ' + err.message, 'warn');
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', onWindowResize);
+
+        // Start animation loop
+        log('initialize3DScene: initialization complete, starting 3D animation loop');
+        animate3D();
+    }
+
+    // --- CAMERA CONTROL CLASS ---
+    class CameraControl3D {
+        constructor(camera, domElement) {
+            this.camera = camera;
+            this.domElement = domElement;
+            this.keys = {};
+            this.mouseDown = false;
+            this.mouseX = 0;
+            this.mouseY = 0;
+            this.euler = new THREE.Euler(0, 0, 0, 'YXZ');
+            this.targetEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+            this.velocity = new THREE.Vector3();
+            this.moveSpeed = 0.5;
+            this.lookSpeed = 0.002;
+
+            this.setupEventListeners();
+        }
+
+        setupEventListeners() {
+            document.addEventListener('keydown', (e) => this.keys[e.key.toUpperCase()] = true);
+            document.addEventListener('keyup', (e) => this.keys[e.key.toUpperCase()] = false);
+
+            this.domElement.addEventListener('mousedown', (e) => {
+                this.mouseDown = true;
+                this.mouseX = e.clientX;
+                this.mouseY = e.clientY;
+                try { log(`CameraControl3D: mousedown at ${e.clientX},${e.clientY}`); } catch(e){}
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (!this.mouseDown) return;
+                const deltaX = e.clientX - this.mouseX;
+                const deltaY = e.clientY - this.mouseY;
+                this.targetEuler.setFromQuaternion(this.camera.quaternion);
+                this.targetEuler.y -= deltaX * this.lookSpeed;
+                this.targetEuler.x -= deltaY * this.lookSpeed;
+                this.targetEuler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.targetEuler.x));
+                this.mouseX = e.clientX;
+                this.mouseY = e.clientY;
+                try { if (Math.random() < 0.1) log(`CameraControl3D: mouse look delta ${deltaX},${deltaY}`); } catch(e){}
+            });
+
+            document.addEventListener('mouseup', () => { this.mouseDown = false; });
+
+            this.domElement.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                this.moveSpeed += e.deltaY > 0 ? -0.05 : 0.05;
+                this.moveSpeed = Math.max(0.1, Math.min(2, this.moveSpeed));
+                try { log(`CameraControl3D: moveSpeed adjusted to ${this.moveSpeed.toFixed(2)} via wheel (deltaY=${e.deltaY})`); } catch(e){}
+            });
+        }
+
+        update() {
+            const direction = new THREE.Vector3();
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+
+            if (this.keys['W'] || this.keys['ARROWUP']) direction.add(forward);
+            if (this.keys['S'] || this.keys['ARROWDOWN']) direction.sub(forward);
+            if (this.keys['A'] || this.keys['ARROWLEFT']) direction.sub(right);
+            if (this.keys['D'] || this.keys['ARROWRIGHT']) direction.add(right);
+            if (this.keys[' ']) direction.y += 1;
+            if (this.keys['SHIFT']) direction.y -= 1;
+
+            if (direction.length() > 0) {
+                direction.normalize();
+                this.velocity.copy(direction).multiplyScalar(this.moveSpeed);
+                this.camera.position.add(this.velocity);
+                // occasional debug note (throttled)
+                if (Math.random() < 0.06) try { log(`CameraControl3D: moved to ${this.camera.position.x.toFixed(1)},${this.camera.position.y.toFixed(1)},${this.camera.position.z.toFixed(1)} (speed=${this.moveSpeed.toFixed(2)})`); } catch(e){}
+            }
+
+            // Smooth look
+            this.euler.copy(this.targetEuler);
+            this.camera.quaternion.setFromEuler(this.euler);
+        }
+    }
+
+    function onWindowResize() {
+        if (!renderer) return;
+        const width = cameraContainer.clientWidth;
+        const height = cameraContainer.clientHeight;
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+        try { log(`onWindowResize: resized renderer to ${width}x${height}`); } catch(e){}
+    }
+
+    function animate3D() {
+        requestAnimationFrame(animate3D);
+        if (!is3DMode) return;
+
+        try {
+            if (cameraControls) cameraControls.update();
+            camPosDisplay.textContent = `${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)}`;
+            // keep camera marker in sync with camera
+            if (cameraSphere) {
+                try { cameraSphere.position.copy(camera.position); } catch(e) { }
+            }
+                // update DOM labels for camera and target
+                try { updateLabels(); } catch(e) { /* ignore */ }
+            renderer.render(scene, camera);
+        } catch (err) {
+            log('animate3D: ERROR during render/update: ' + (err && err.message ? err.message : err), 'error');
+            console.error(err);
+            // attempt a soft recovery: disable 3D mode so user can inspect
+            is3DMode = false;
+            try {
+                if (renderer && renderer.domElement && renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
+            } catch(e){}
+            try { log('animate3D: Exiting 3D mode due to error. Check debug console for details.', 'warn'); } catch(e){}
+        }
+    }
+
+    function update3DScene() {
+        if (flightData.length === 0) {
+            log('update3DScene: WARNING - flightData empty, skipping 3D update', 'warn');
+            return;
+        }
+
+        const frame = flightData[currentIndex];
+        if (!frame) { log(`update3DScene: WARNING - No frame at index ${currentIndex}`, 'warn'); return; }
+
+        // Validate fields
+        if (frame.Yaw === undefined) log(`update3DScene: WARNING - frame.Yaw undefined at index ${currentIndex}`, 'warn');
+        if (frame.Dist === undefined) log(`update3DScene: WARNING - frame.Dist undefined at index ${currentIndex}`, 'warn');
+
+        // Dump the full frame for deep debugging (large); truncate if huge
+        try {
+            const dump = JSON.stringify(frame);
+            log(`update3DScene: frame dump (idx ${currentIndex}): ${dump.length > 1000 ? dump.slice(0,1000) + '... (truncated)' : dump}`);
+        } catch(e) { log('update3DScene: WARNING - failed to JSON.stringify(frame)', 'warn'); }
+
+        try { log(`update3DScene: scene children count=${scene ? scene.children.length : 'no-scene'}`); } catch(e){}
+
+        try {
+            // Convert top-down 2D coords to 3D world coords
+            const yawRad = (frame.Yaw || 0) * (Math.PI / 180);
+            const targetWorldX = Math.sin(yawRad) * (frame.Dist || 0);
+            const targetWorldZ = Math.cos(yawRad) * (frame.Dist || 0);
+
+            if (targetObject) {
+                targetObject.position.set(targetWorldX, 5, targetWorldZ);
+                targetObject.rotation.y = yawRad;
+            } else {
+                log('update3DScene: WARNING - targetObject is not set', 'warn');
+            }
+
+            // Predicted position
+            if (frame.PredX === undefined) {
+                log(`update3DScene: PredX undefined for frame ${currentIndex} — predicted object will not be updated`, 'warn');
+            } else if (predictedObject) {
+                const yawRadPred = Math.atan((frame.PredX - CENTER_X) / FOCAL_LENGTH);
+                const predDist = Math.max(0, (frame.Dist || 0) + ((frame.Vel || 0) * 0.051));
+                const predWorldX = Math.sin(yawRadPred) * predDist;
+                const predWorldZ = Math.cos(yawRadPred) * predDist;
+                predictedObject.position.set(predWorldX, 5, predWorldZ);
+            }
+
+            // Update trails
+            try { updateTrails(); } catch (err) { log('update3DScene: WARNING - updateTrails failed: ' + err.message, 'warn'); }
+        } catch (err) {
+            log('update3DScene: ERROR processing frame: ' + (err.message || err), 'error');
+            console.error(err);
+        }
+    }
+
+    function updateTrails() {
+        const targetPositions = [];
+        const predPositions = [];
+
+        const start = Math.max(0, currentIndex - 100);
+        for (let i = start; i <= currentIndex; i++) {
+            const f = flightData[i];
+            if (!f.Found) continue;
+
+            const yawRad = f.Yaw * (Math.PI / 180);
+            const wx = Math.sin(yawRad) * f.Dist;
+            const wz = Math.cos(yawRad) * f.Dist;
+            targetPositions.push(wx, 4, wz);
+
+            if (f.PredX !== undefined) {
+                const yawRadPred = Math.atan((f.PredX - CENTER_X) / FOCAL_LENGTH);
+                const predDist = Math.max(0, f.Dist + (f.Vel * 0.051));
+                const pwx = Math.sin(yawRadPred) * predDist;
+                const pwz = Math.cos(yawRadPred) * predDist;
+                predPositions.push(pwx, 4, pwz);
+            }
+        }
+
+        if (targetPositions.length > 0) {
+            trailLineTarget.geometry.dispose();
+            trailLineTarget.geometry = new THREE.BufferGeometry();
+            trailLineTarget.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(targetPositions), 3));
+            try { log(`updateTrails: targetPositions count=${targetPositions.length/3}`); } catch(e){}
+        }
+
+        if (predPositions.length > 0) {
+            trailLinePredicted.geometry.dispose();
+            trailLinePredicted.geometry = new THREE.BufferGeometry();
+            trailLinePredicted.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(predPositions), 3));
+            try { log(`updateTrails: predPositions count=${predPositions.length/3}`); } catch(e){}
+        }
+    }
+
+    function toggleView() {
+        is3DMode = !is3DMode;
+        log(`toggleView: switching to ${is3DMode ? '3D' : '2D'} mode; flightData.length=${flightData.length}`);
+        const canvas2D = document.getElementById('simCanvas');
+        
+        if (is3DMode) {
+            canvas2D.style.display = 'none';
+            cameraContainer.style.cursor = 'grab';
+            cameraInfo.classList.add('show');
+            btnToggleView.textContent = '🔄 3D Mode';
+            btnToggleView.classList.add('active');
+            
+            if (!scene) {
+                log('toggleView: scene not initialized, calling initialize3DScene()');
+                initialize3DScene();
+            } else {
+                log('toggleView: scene already initialized');
+            }
+            if (!renderer) log('toggleView: WARNING - renderer not available after initialize3DScene()', 'warn');
+            update3DScene();
+            onWindowResize();
+            log("Switched to 3D view. Controls: WASD/Arrows to move, Mouse to look, Scroll to adjust speed.");
+        } else {
+            canvas2D.style.display = 'block';
+            cameraContainer.style.cursor = 'crosshair';
+            cameraInfo.classList.remove('show');
+            btnToggleView.textContent = '🔄 2D Mode';
+            btnToggleView.classList.remove('active');
+            draw();
+            log("Switched to 2D view.");
+        }
+    }
+
+    btnToggleView.addEventListener('click', toggleView);
 
     // --- DATA LOADING ---
     function loadCsvFromUrl(url) {
@@ -543,7 +1161,9 @@
             return;
         }
 
-        ctx.setTransform(zoom, 0, 0, zoom, (width - width * zoom) / 2, (height - height * zoom) / 2);
+        const translateX = (width - width * zoom) / 2 + panX;
+        const translateY = (height - height * zoom) / 2 + panY;
+        ctx.setTransform(zoom, 0, 0, zoom, translateX, translateY);
 
         drawRadarGrid();
         
@@ -729,7 +1349,12 @@
         if(currentIndex < 0) currentIndex = 0;
         
         timeline.value = currentIndex;
-        draw();
+        
+        if (is3DMode) {
+            update3DScene();
+        } else {
+            draw();
+        }
     }
 
     timeline.addEventListener('input', (e) => {
@@ -748,6 +1373,10 @@
         btnPause.style.display = isPlaying ? 'inline-block' : 'none';
 
         if(isPlaying) {
+            // If we're at the last frame, restart from the beginning
+            if (currentIndex >= flightData.length - 1) {
+                updateFrame(0);
+            }
             log("Playback started.");
             playInterval = setInterval(() => {
                 if(currentIndex < flightData.length - 1) {
@@ -793,6 +1422,40 @@
         const delta = e.deltaY > 0 ? -0.1 : 0.1;
         updateZoom(delta);
     });
+
+    // WASD / Arrow controls for top-down panning
+    document.addEventListener('keydown', (e) => {
+        if (is3DMode) return; // only for 2D view
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+        const active = document.activeElement;
+        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+        const k = e.key.toLowerCase();
+        if (k === 'w' || k === 'arrowup') keys2D.up = true;
+        if (k === 's' || k === 'arrowdown') keys2D.down = true;
+        if (k === 'a' || k === 'arrowleft') keys2D.left = true;
+        if (k === 'd' || k === 'arrowright') keys2D.right = true;
+    });
+
+    document.addEventListener('keyup', (e) => {
+        const k = e.key.toLowerCase();
+        if (k === 'w' || k === 'arrowup') keys2D.up = false;
+        if (k === 's' || k === 'arrowdown') keys2D.down = false;
+        if (k === 'a' || k === 'arrowleft') keys2D.left = false;
+        if (k === 'd' || k === 'arrowright') keys2D.right = false;
+    });
+
+    function animate2D() {
+        requestAnimationFrame(animate2D);
+        if (is3DMode) return;
+        const speed = panSpeedBase / Math.max(0.1, zoom);
+        let moved = false;
+        if (keys2D.up) { panY += speed; moved = true; }
+        if (keys2D.down) { panY -= speed; moved = true; }
+        if (keys2D.left) { panX += speed; moved = true; }
+        if (keys2D.right) { panX -= speed; moved = true; }
+        if (moved) draw();
+    }
+    animate2D();
 
     // Initial Load
     log("System initialized. Waiting to load data...");
